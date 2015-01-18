@@ -1,6 +1,7 @@
 package netlinkAudit
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
@@ -639,15 +640,19 @@ func Getreply(s *NetlinkSocket, done <-chan bool, msgchan chan string, errchan c
 			} else if m.Header.Type == AUDIT_FIRST_USER_MSG {
 				log.Println("AUDIT_FIRST_USER_MSG")
 			} else if m.Header.Type == AUDIT_SYSCALL {
-				msgchan <- ("type=SYSCALL " + "msg=" + string(m.Data[:]))
+				msgchan <- ("SYSCALL " + string(m.Data[:]))
 			} else if m.Header.Type == AUDIT_CWD {
-				msgchan <- ("type=CWD " + "msg=" + string(m.Data[:]))
+				msgchan <- ("CWD " + string(m.Data[:]))
 			} else if m.Header.Type == AUDIT_PATH {
-				msgchan <- ("type=PATH " + "msg=" + string(m.Data[:]))
+				msgchan <- ("PATH " + string(m.Data[:]))
+			} else if m.Header.Type == AUDIT_AVC {
+				msgchan <- ("AVC " + string(m.Data[:]))
 			} else if m.Header.Type == AUDIT_EOE {
 				// log.Println("Event Ends ", string(m.Data[:]))
 			} else if m.Header.Type == AUDIT_CONFIG_CHANGE {
-				msgchan <- ("type=CONFIG_CHANGE " + "msg=" + string(m.Data[:]))
+				msgchan <- ("CONFIG_CHANGE " + string(m.Data[:]))
+			} else if m.Header.Type == AUDIT_EXECVE {
+				msgchan <- ("EXECVE " + string(m.Data[:]))
 			} else {
 				log.Println("Unknown: ", m.Header.Type)
 			}
@@ -815,8 +820,56 @@ done:
 var _audit_permadded bool
 var _audit_syscalladded bool
 
-// Load x86 map and fieldtab.json
-func loadSysMap_FieldTab(conf *Config, fieldmap *Field) error {
+// Load x86_64 map
+func Load_SysmapX64() (map[string]int, error) {
+	// Loads syscalls into a map with key as their syscall names
+	/*
+	   0	read
+	   1	write
+	   2	open
+	*/
+	inFile, err := os.Open("netlinkAudit/sysmapx64")
+	if err != nil {
+		return nil, err
+	}
+	defer inFile.Close()
+	scanner := bufio.NewScanner(inFile)
+	scanner.Split(bufio.ScanLines)
+	sysmap := make(map[string]int)
+	for scanner.Scan() {
+		vals := strings.Split(scanner.Text(), "\t")
+		sno, err := strconv.Atoi(vals[0])
+		if err == nil {
+			sysmap[vals[1]] = sno
+		}
+	}
+	return sysmap, nil
+}
+
+// load fieldmap
+func loadfieldmap() (map[string]int, error) {
+	// load fieldmaps into a map with key as fieldname
+	inFile, err := os.Open("netlinkAudit/fieldmap")
+	if err != nil {
+		return nil, err
+	}
+	defer inFile.Close()
+	scanner := bufio.NewScanner(inFile)
+	scanner.Split(bufio.ScanLines)
+	fieldmap := make(map[string]int)
+	for scanner.Scan() {
+		vals := strings.Split(scanner.Text(), " ")
+		sno, err := strconv.Atoi(vals[1])
+		if err == nil {
+			fieldmap[vals[0]] = sno
+		}
+	}
+	return fieldmap, nil
+
+}
+
+// Deprecated
+func LoadSysMap_FieldTab(conf *Config, fieldmap *Field) error {
 	content2, err := ioutil.ReadFile("netlinkAudit/audit_x86_64.json")
 	if err != nil {
 		return err
@@ -869,15 +922,18 @@ func SetRules(s *NetlinkSocket) error {
 			return err
 		}
 	}
-	var conf Config
-	var fieldmap Field
+	// var conf Config
+	// var fieldmap Field
 
-	// Load x86 map and fieldtab.json
-	err = loadSysMap_FieldTab(&conf, &fieldmap)
+	sysmap, err := Load_SysmapX64()
 	if err != nil {
-		log.Println("Error :", err)
 		return err
 	}
+	// err = LoadSysMap_FieldTab(&conf, &fieldmap)
+	// if err != nil {
+	// 	log.Println("Error :", err)
+	// 	return err
+	// }
 
 	for k, v := range m {
 		switch k {
@@ -905,96 +961,97 @@ func SetRules(s *NetlinkSocket) error {
 			vi := v.([]interface{})
 			for sruleNo := range vi {
 				srule := vi[sruleNo].(map[string]interface{})
+				// set rules
+				log.Println("setting syscall rule", srule["name"], sysmap[srule["name"].(string)])
+				var dd AuditRuleData
+				dd.Buf = make([]byte, 0)
+				sno := sysmap[srule["name"].(string)] //Lookup syscall name in the map and get the syscall number
+				if sno > -1 {
+					err = AuditRuleSyscallData(&dd, sno)
+					if err == nil {
+						_audit_syscalladded = true
+					} else {
+						return err
+					}
+					actions := srule["action"].([]interface{})
+					//log.Println(actions)
 
-				for l := range conf.Xmap {
-					if conf.Xmap[l].Name == srule["name"] {
-						// set rules
-						log.Println("setting syscall rule", conf.Xmap[l].Name)
-						var dd AuditRuleData
-						dd.Buf = make([]byte, 0)
+					//APPLYING ACTIONS ON SYSCALLS by separating the filters i.e exit from action i.e. always
+					action := 0
+					filter := 0
+					//supposes that actions and filters are written as always,exit or never,exit not viceversa
+					if actions[0] == "never" {
+						action = AUDIT_NEVER
+					} else if actions[0] == "possible" {
+						action = AUDIT_POSSIBLE
+					} else if actions[0] == "always" {
+						action = AUDIT_ALWAYS
+					} else {
+						action = -1
+					}
 
-						err = AuditRuleSyscallData(&dd, conf.Xmap[l].Id)
-						if err == nil {
-							_audit_syscalladded = true
-						} else {
+					if actions[1] == "task" {
+						filter = AUDIT_FILTER_TASK
+					} else if actions[1] == "entry" {
+						log.Println("Support for Entry Filter is Deprecated!! Switching back to Exit filter")
+						filter = AUDIT_FILTER_EXIT
+					} else if actions[1] == "exit" {
+						filter = AUDIT_FILTER_EXIT
+					} else if actions[1] == "user" {
+						filter = AUDIT_FILTER_USER
+					} else if actions[1] == "exclude" {
+						filter = AUDIT_FILTER_EXCLUDE
+					} else {
+						filter = AUDIT_FILTER_UNSET
+					}
+
+					for _, field := range srule["fields"].([]interface{}) {
+						fieldval := field.(map[string]interface{})["value"]
+						op := field.(map[string]interface{})["op"]
+						fieldname := field.(map[string]interface{})["name"]
+						//log.Println(fieldval, op, fieldname)
+						var opval uint32
+						if op == "nt_eq" {
+							opval = AUDIT_NOT_EQUAL
+						} else if op == "gt_or_eq" {
+							opval = AUDIT_GREATER_THAN_OR_EQUAL
+						} else if op == "lt_or_eq" {
+							opval = AUDIT_LESS_THAN_OR_EQUAL
+						} else if op == "and_eq" {
+							opval = AUDIT_BIT_TEST
+						} else if op == "eq" {
+							opval = AUDIT_EQUAL
+						} else if op == "gt" {
+							opval = AUDIT_GREATER_THAN
+						} else if op == "lt" {
+							opval = AUDIT_LESS_THAN
+						} else if op == "and" {
+							opval = AUDIT_BIT_MASK
+						}
+						//Take appropriate action according to filters provided
+						err = AuditRuleFieldPairData(&dd, fieldval, opval, fieldname.(string), filter) // &AUDIT_BIT_MASK
+						if err != nil {
 							return err
 						}
-						actions := srule["action"].([]interface{})
-						//log.Println(actions)
-
-						//NOW APPLY ACTIONS ON SYSCALLS by separating the filters i.e exit from action i.e. always
-						action := 0
-						filter := 0
-						//This part supposes that actions and filters are written as always,exit or never,exit not viceversa
-						if actions[0] == "never" {
-							action = AUDIT_NEVER
-						} else if actions[0] == "possible" {
-							action = AUDIT_POSSIBLE
-						} else if actions[0] == "always" {
-							action = AUDIT_ALWAYS
-						} else {
-							action = -1
-						}
-
-						if actions[1] == "task" {
-							filter = AUDIT_FILTER_TASK
-						} else if actions[1] == "entry" {
-							log.Println("Support for Entry Filter is Deprecated!! Switching back to Exit filter")
-							filter = AUDIT_FILTER_EXIT
-						} else if actions[1] == "exit" {
-							filter = AUDIT_FILTER_EXIT
-						} else if actions[1] == "user" {
-							filter = AUDIT_FILTER_USER
-						} else if actions[1] == "exclude" {
-							filter = AUDIT_FILTER_EXCLUDE
-						} else {
-							filter = AUDIT_FILTER_UNSET
-						}
-
-						for _, field := range srule["fields"].([]interface{}) {
-							fieldval := field.(map[string]interface{})["value"]
-							op := field.(map[string]interface{})["op"]
-							fieldname := field.(map[string]interface{})["name"]
-							//log.Println(fieldval, op, fieldname)
-							var opval uint32
-							if op == "nt_eq" {
-								opval = AUDIT_NOT_EQUAL
-							} else if op == "gt_or_eq" {
-								opval = AUDIT_GREATER_THAN_OR_EQUAL
-							} else if op == "lt_or_eq" {
-								opval = AUDIT_LESS_THAN_OR_EQUAL
-							} else if op == "and_eq" {
-								opval = AUDIT_BIT_TEST
-							} else if op == "eq" {
-								opval = AUDIT_EQUAL
-							} else if op == "gt" {
-								opval = AUDIT_GREATER_THAN
-							} else if op == "lt" {
-								opval = AUDIT_LESS_THAN
-							} else if op == "and" {
-								opval = AUDIT_BIT_MASK
-							}
-							//Take appropriate action according to filters provided
-							err = AuditRuleFieldPairData(&dd, fieldval, opval, fieldname.(string), fieldmap, filter) // &AUDIT_BIT_MASK
-							if err != nil {
-								return err
-							}
-						}
-
-						// foo.Fields[foo.Field_count] = AUDIT_ARCH
-						// foo.Fieldflags[foo.Field_count] = AUDIT_EQUAL
-						// foo.Values[foo.Field_count] = AUDIT_ARCH_X86_64
-						// foo.Field_count++
-						// AuditAddRuleData(s, &foo, AUDIT_FILTER_EXIT, AUDIT_ALWAYS)
-
-						if filter != AUDIT_FILTER_UNSET {
-							AuditAddRuleData(s, &dd, filter, action)
-						} else {
-							return fmt.Errorf("Filters Not Set")
-						}
-
+					}
+					if filter != AUDIT_FILTER_UNSET {
+						AuditAddRuleData(s, &dd, filter, action)
+					} else {
+						return fmt.Errorf("Filters Not Set")
 					}
 				}
+
+				/*
+					for l := range conf.Xmap {
+						if conf.Xmap[l].Name == srule["name"] {
+							// foo.Fields[foo.Field_count] = AUDIT_ARCH
+							// foo.Fieldflags[foo.Field_count] = AUDIT_EQUAL
+							// foo.Values[foo.Field_count] = AUDIT_ARCH_X86_64
+							// foo.Field_count++
+							// AuditAddRuleData(s, &foo, AUDIT_FILTER_EXIT, AUDIT_ALWAYS)
+						}
+					}
+				*/
 			}
 		}
 	}
@@ -1039,7 +1096,7 @@ var (
 	errMaxLen   = errors.New("MAX length Exceeded")
 )
 
-func AuditRuleFieldPairData(rule *AuditRuleData, fieldval interface{}, opval uint32, fieldname string, fieldmap Field, flags int) error {
+func AuditRuleFieldPairData(rule *AuditRuleData, fieldval interface{}, opval uint32, fieldname string, flags int) error {
 
 	if rule.Field_count >= (AUDIT_MAX_FIELDS - 1) {
 		log.Println("Max Fields Exceeded !!")
@@ -1047,13 +1104,12 @@ func AuditRuleFieldPairData(rule *AuditRuleData, fieldval interface{}, opval uin
 	}
 
 	var fieldid uint32
-	for f := range fieldmap.Fieldmap {
-		if fieldmap.Fieldmap[f].Name == fieldname {
-			//log.Println("Found :", fieldmap.Fieldmap[f])
-			fieldid = (uint32)(fieldmap.Fieldmap[f].Fieldid)
-		}
+	fieldmap, err := loadfieldmap()
+	if err != nil {
+		return err
 	}
-
+	log.Println(fieldmap[fieldname], fieldname)
+	fieldid = (uint32)(fieldmap[fieldname])
 	rule.Fields[rule.Field_count] = fieldid
 	rule.Fieldflags[rule.Field_count] = opval
 
