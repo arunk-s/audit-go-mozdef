@@ -2,14 +2,42 @@ package main
 
 import (
 	"./netlinkAudit"
+	"bufio"
 	"log"
 	"os"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
 
 var done chan bool
 var debug bool
+
+func load_SysmapX64_i() (map[int]string, error) {
+	// Loads syscalls into a map with key as their syscall numbers
+	/*
+	   0    read
+	   1    write
+	   2    open
+	*/
+	inFile, err := os.Open("netlinkAudit/sysmapx64")
+	if err != nil {
+		return nil, err
+	}
+	defer inFile.Close()
+	scanner := bufio.NewScanner(inFile)
+	scanner.Split(bufio.ScanLines)
+	sysmap := make(map[int]string)
+	for scanner.Scan() {
+		vals := strings.Split(scanner.Text(), "\t")
+		sno, err := strconv.Atoi(vals[0])
+		if err == nil {
+			sysmap[sno] = vals[1]
+		}
+	}
+	return sysmap, nil
+}
 
 func main() {
 	s, err := netlinkAudit.GetNetlinkSocket()
@@ -63,11 +91,66 @@ func main() {
 		log.Fatalln("Error Creating File!!")
 	}
 	defer f.Close()
+	// Load x64 map
+	sysmap, err := load_SysmapX64_i()
+	if err != nil {
+		log.Fatalln("Error :", err)
+	}
+
 	go func() {
 		for {
 			select {
 			case ev := <-msg:
 				log.Println(ev + "\n")
+				split := strings.Split(ev, " ")
+				// Timestamp and serial num separation
+				var timestamp string
+				var serial string
+				if len(split) > 0 {
+					if len(split[1]) > 0 {
+						ts := strings.Split(split[1], "(")
+						if len(ts) == 2 {
+							ts = strings.Split(ts[1], ")")
+							timestampx := strings.Split(ts[0], ":")
+							timestamp = timestampx[0]
+							serial = timestampx[1]
+							log.Println(timestamp, serial)
+						}
+
+					}
+					//TODO Timestamp and event coordination
+					data := split[2:]
+					valmap := make(map[string]string)
+					// valmap stores all the values with fieldnames as the key
+					for i := 0; i < len(data); i++ {
+						values := strings.Split(data[i], "=")
+						if len(values) >= 2 {
+							valmap[values[0]] = values[1]
+						}
+						// log.Println(values)
+					}
+
+					if split[0] == "SYSCALL" {
+						log.Println("For Syscall:", valmap["syscall"])
+						sno, err := strconv.Atoi(valmap["syscall"])
+						// Get syscall name, No arch detection, assuming 64 bits
+						if err == nil {
+							name := sysmap[sno]
+							log.Println("Syscall", name)
+						} else {
+							log.Println(err)
+						}
+					} else if split[0] == "CWD" {
+
+					} else if split[0] == "PATH" {
+
+					} else if split[0] == "EXECVE" {
+
+					} else if split[0] == "AVC" {
+
+					}
+				}
+
 				_, err := f.WriteString(ev + "\n")
 				if err != nil {
 					log.Println("Writing Error!!")

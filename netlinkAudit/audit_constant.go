@@ -38,7 +38,7 @@ const (
 	AUDIT_CWD           = 1307 /* Current working directory */
 	AUDIT_EXECVE        = 1309 /* execve arguments */
 	AUDIT_EOE           = 1320 /* End of multi-record event */
-
+	AUDIT_AVC           = 1400
 	/* Rule fields */
 	/* These are useful when checking the
 	 * task structure at task creation time
