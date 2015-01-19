@@ -14,6 +14,17 @@ import (
 var done chan bool
 var debug bool
 
+type json_msg_type struct {
+	category    string
+	summary     string
+	severity    string
+	hostname    string
+	processid   uint32
+	processname string
+	timestamp   string
+	// may be ring buffer
+}
+
 func load_SysmapX64_i() (map[int]string, error) {
 	// Loads syscalls into a map with key as their syscall numbers
 	/*
@@ -130,6 +141,33 @@ func main() {
 						// log.Println(values)
 					}
 
+					t_hostname, err := os.Hostname()
+					if err != nil {
+						t_hostname = "localhost"
+						log.Printf("Cannot find Hostname, using %s as hostname", t_hostname)
+					}
+
+					var json_msg json_msg_type = json_msg_type{
+						severity:  "INFO",
+						hostname:  t_hostname,
+						processid: 0,
+					}
+					timestamp_ := strings.Split(timestamp, ".")
+					i := timestamp_[0]
+					i_ := timestamp_[1]
+					seconds, err := strconv.ParseInt(i, 10, 64)
+					if err != nil {
+						panic(err)
+					}
+					millis, err := strconv.ParseInt(i_, 10, 64)
+					if err != nil {
+						panic(err)
+					}
+					// log.Fatalln doesn't close resources
+
+					tm := time.Unix((seconds), millis*1000000).String()
+					json_msg.timestamp = tm
+
 					if split[0] == "SYSCALL" {
 						log.Println("For Syscall:", valmap["syscall"])
 						sno, err := strconv.Atoi(valmap["syscall"])
@@ -140,6 +178,11 @@ func main() {
 						} else {
 							log.Println(err)
 						}
+						// Way to store ?
+						if valmap["comm"] != "" {
+							json_msg.processname = valmap["comm"]
+						}
+
 					} else if split[0] == "CWD" {
 
 					} else if split[0] == "PATH" {
@@ -149,8 +192,9 @@ func main() {
 					} else if split[0] == "AVC" {
 
 					}
-				}
+					log.Println(json_msg)
 
+				}
 				_, err := f.WriteString(ev + "\n")
 				if err != nil {
 					log.Println("Writing Error!!")
